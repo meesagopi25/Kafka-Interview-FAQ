@@ -1,6 +1,5 @@
 Below is a **deep, step-by-step, interview-ready explanation of Question 01**, covering **both ZooKeeper mode and KRaft mode**, with **exact technical commands** you can run to **observe and validate controller election** in real clusters.
 
-This version is suitable to **replace or extend `question-01-controller-election.md`** in your GitHub repo.
 
 ---
 
