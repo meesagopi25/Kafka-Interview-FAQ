@@ -20,7 +20,7 @@ kafka-architecture-interview/
 
 ### 01. Control Plane
 
-* [Question 01 – How is the Kafka controller elected?](01-control-plane/question-01-controller-election.md)
+* [Question 01 – How is the Kafka controller elected?](01-control-plane/01-controller-election.md)
 
 ### 02. Replication & Durability
 
