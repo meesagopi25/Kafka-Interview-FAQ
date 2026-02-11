@@ -408,3 +408,433 @@ If you want next, I can:
 * Continue with **Question-02 at the same depth**
 
 Just tell me 👍
+
+`KafkaRaftServer.startup()` is the **entry point that boots Kafka’s Raft-based control plane** in **KRaft mode**.
+It initializes the **Raft runtime**, **loads metadata**, **starts elections**, and **decides whether this node becomes the controller (Raft leader) or stays a follower**.
+
+Below is a **precise, step-by-step explanation** of what actually happens.
+
+---
+
+## Context
+
+In **Apache Kafka** **KRaft mode**, there is **no ZooKeeper**.
+All metadata (topics, partitions, ISR, leaders) lives in a **replicated metadata log**, coordinated by **Raft**.
+
+`KafkaRaftServer.startup()` is invoked during broker/controller process startup when:
+
+```properties
+process.roles=controller   # or broker,controller
+```
+
+---
+
+## High-Level Responsibility
+
+> **`KafkaRaftServer.startup()` initializes and starts the Raft subsystem that powers Kafka’s controller quorum.**
+
+It does **not** serve client traffic.
+It is **pure control-plane bootstrapping**.
+
+---
+
+## What the Method Does — Step by Step
+
+### 1️⃣ Load KRaft Configuration
+
+Reads critical properties:
+
+* `node.id`
+* `process.roles`
+* `controller.quorum.voters`
+* `metadata.log.dir`
+* TLS/SASL for controller listeners
+
+Validates:
+
+* This node is part of the controller quorum
+* Quorum voter IDs are consistent
+
+❌ If invalid → Kafka **fails fast** (won’t start partially)
+
+---
+
+### 2️⃣ Initialize the Metadata Log
+
+Opens Kafka’s **internal metadata log** (not a user topic):
+
+* Stored on disk (e.g. `metadata.log.dir`)
+* Replicated via Raft
+* Single, ordered source of truth
+
+Actions:
+
+* Load log segments
+* Recover last committed offset
+* Validate log consistency
+
+📌 This replaces **all ZooKeeper znodes**.
+
+---
+
+### 3️⃣ Create the Raft Client & Network Layer
+
+Initializes:
+
+* Raft RPC channels between controllers
+* Heartbeat threads
+* RequestVote / AppendEntries handlers
+
+At this point:
+
+```text
+Raft state = FOLLOWER
+Current term = last known term (or 0)
+```
+
+---
+
+### 4️⃣ Register with the Controller Quorum
+
+The node announces itself to other quorum members:
+
+* Opens controller listener (e.g. `:9093`)
+* Starts accepting Raft messages
+* Begins heartbeat scheduling
+
+No leader is assumed yet.
+
+---
+
+### 5️⃣ Start the Raft Election Timer
+
+If **no leader heartbeat** is received within the election timeout:
+
+```text
+FOLLOWER → CANDIDATE
+```
+
+This triggers:
+
+* Increment Raft term
+* Send `RequestVote` RPCs to all voters
+
+---
+
+### 6️⃣ Participate in Leader Election
+
+Outcomes:
+
+* ✅ **Wins majority vote**
+  → becomes **Raft LEADER**
+  → becomes **Kafka Controller**
+* ❌ **Loses or times out**
+  → remains FOLLOWER and waits
+
+This is **consensus-based**, not a race.
+
+---
+
+### 7️⃣ If Elected Leader → Become Active Controller
+
+Only if elected:
+
+The node now:
+
+* Owns the metadata log
+* Appends metadata records
+* Performs partition leader elections
+* Publishes metadata snapshots to brokers
+
+Log message you’ll see:
+
+```text
+Elected as metadata leader for term X
+Becoming the active controller
+```
+
+---
+
+### 8️⃣ If Follower → Track the Leader
+
+If not elected:
+
+* Applies metadata updates from leader
+* Keeps metadata log in sync
+* Stays ready to take over if leader fails
+
+---
+
+## What `KafkaRaftServer.startup()` Does NOT Do
+
+❌ Does not accept producer/consumer requests
+❌ Does not handle partition reads/writes
+❌ Does not decide partition leaders directly (unless elected controller)
+
+Those are broker-side responsibilities.
+
+---
+
+## How This Differs from ZooKeeper Mode
+
+| ZooKeeper Mode             | KRaft Mode             |
+| -------------------------- | ---------------------- |
+| Create `/controller` znode | Start Raft election    |
+| External coordination      | Internal consensus     |
+| Race-based                 | Majority vote          |
+| ZK session expiry          | Raft heartbeat timeout |
+
+`KafkaRaftServer.startup()` replaces **all of this**.
+
+---
+
+## How to Observe It Live (Commands)
+
+### Check who is controller (Raft leader)
+
+```bash
+kafka-metadata-quorum.sh \
+  --bootstrap-server localhost:9092 \
+  describe --status
+```
+
+### Watch controller logs
+
+```bash
+grep -i "raft\\|controller" server.log
+```
+
+### Typical startup log sequence
+
+```text
+Initializing KafkaRaftServer
+Starting Raft client
+Becoming candidate for term 5
+Elected as metadata leader for term 5
+Becoming the active controller
+```
+
+---
+
+## Interview-Ready Explanation (Short)
+
+> **`KafkaRaftServer.startup()` boots Kafka’s Raft subsystem: it loads the metadata log, joins the controller quorum, starts Raft elections, and—if elected—turns the node into the active controller.**
+
+---
+
+## One-Liner (Very Strong)
+
+> **KafkaRaftServer.startup() is the moment Kafka’s control plane comes alive.**
+
+---
+
+If you want next, I can:
+
+* Walk through **Raft RequestVote and AppendEntries messages**
+* Map this method to **exact Kafka source classes**
+* Explain **what happens during controller failover**
+* Add this explanation directly into your **Question-01 GitHub file**
+
+Just tell me.
+
+Excellent question — this goes **straight to the heart of Raft** and is a **classic interview trap**.
+Let’s answer it **precisely**, **step by step**, and **without hand-waving**.
+
+---
+
+# What if **all controller quorum members** send `RequestVote` RPCs at the same time?
+
+Short answer:
+
+> **No leader is elected in that round.
+> Raft resolves this automatically using randomized election timeouts.**
+
+Now let’s unpack *why* and *how*.
+
+---
+
+## 1️⃣ Why This Situation Can Happen
+
+In a Kafka **KRaft controller quorum**, all nodes start as **FOLLOWERS**.
+
+If:
+
+* The cluster starts cold **or**
+* The current controller crashes
+
+Then:
+
+* **No leader heartbeats are present**
+* Each node’s election timer starts ticking
+
+It is **possible** (especially at startup) that:
+
+> Multiple nodes time out around the same time
+> → All become **CANDIDATES**
+> → All send `RequestVote` RPCs
+
+---
+
+## 2️⃣ What Each Node Does When It Becomes a Candidate
+
+When a node becomes a **candidate**, it does **exactly this**:
+
+1. Increments its **Raft term**
+2. Votes for **itself**
+3. Sends `RequestVote(term, candidateId, lastLogIndex)` to **all other voters**
+
+📌 **Important Raft rule**:
+
+> A node can vote **at most once per term**
+
+---
+
+## 3️⃣ Why a Leader Is *NOT* Elected in This Case
+
+Assume a **3-node quorum**:
+
+```
+A, B, C
+```
+
+Each node:
+
+* Votes for itself
+* Rejects others’ vote requests (already voted)
+
+Result:
+
+```
+A: 1 vote
+B: 1 vote
+C: 1 vote
+```
+
+Majority required:
+
+```
+2 out of 3
+```
+
+👉 **No one wins**
+👉 **No leader is elected**
+
+This situation is called a **split vote**.
+
+---
+
+## 4️⃣ How Raft Resolves the Split Vote (Key Mechanism)
+
+Raft uses **randomized election timeouts**.
+
+### 🔑 Critical Design Detail
+
+Each node chooses:
+
+```
+Election timeout = random(150ms – 300ms)
+```
+
+This randomness is **intentional**.
+
+---
+
+## 5️⃣ What Happens Next (Step by Step)
+
+1. The election round fails (no majority)
+2. Nodes revert to **followers**
+3. Election timers restart
+4. One node’s timer expires **earlier than others**
+5. That node becomes candidate **alone**
+6. Sends `RequestVote`
+7. Other nodes:
+
+   * Have not voted yet in this new term
+   * Grant their vote
+
+✅ **Leader is elected**
+
+---
+
+## 6️⃣ Why Raft Always Converges to One Leader
+
+Raft guarantees:
+
+* Randomized timeouts prevent perpetual collisions
+* Only **one leader per term**
+* Majority voting prevents split-brain
+* Failed elections are **safe and expected**
+
+📌 Split votes are **normal**, not a bug.
+
+---
+
+## 7️⃣ What Happens If It Keeps Happening?
+
+Even if split votes happen multiple times:
+
+* Election timeouts are re-randomized **each round**
+* Probability of repeated collision drops exponentially
+* Eventually one node wins
+
+This is mathematically guaranteed.
+
+---
+
+## 8️⃣ Kafka-Specific Behavior (KRaft)
+
+In Kafka:
+
+* Controller quorum size is typically **3 or 5**
+* Dedicated controllers reduce load jitter
+* Election stabilizes extremely fast (milliseconds)
+
+You’ll see logs like:
+
+```text
+Election failed due to split vote
+Retrying election for term 6
+Elected as metadata leader for term 7
+```
+
+---
+
+## 9️⃣ Interview-Ready Answer (Perfect)
+
+> **If all quorum members send RequestVote at the same time, no leader is elected due to split votes. Raft resolves this using randomized election timeouts so that one node eventually times out earlier, gains a majority, and becomes the leader.**
+
+---
+
+## 🔥 One-Liner (Interview Gold)
+
+> **Split votes are expected in Raft; randomized timeouts guarantee convergence to a single leader.**
+
+---
+
+## ❌ Common Wrong Answers (Avoid These)
+
+* ❌ “The node with highest ID wins”
+* ❌ “Kafka picks one randomly”
+* ❌ “ZooKeeper resolves it”
+* ❌ “All become leaders briefly”
+
+All of these are **incorrect**.
+
+---
+
+## 🧠 Mental Model
+
+```
+No leader → everyone tries → nobody wins → wait → one tries first → leader elected
+```
+
+---
+
+If you want next, I can:
+
+* Walk through **RequestVote RPC fields in detail**
+* Explain **AppendEntries vs RequestVote**
+* Show **exact Kafka log lines for split votes**
+* Add this explanation to your GitHub Question-01 file
+
+Just tell me 👍
